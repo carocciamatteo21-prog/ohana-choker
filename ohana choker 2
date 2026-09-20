@@ -1,0 +1,188 @@
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+const PUBLIC_DIR = path.join(__dirname, 'public');
+
+const DEFAULTS = {
+  config: {
+    title: 'Ohana Choker',
+    tagline: 'Gira la ruota e scopri il tuo premio. Ogni giro Ã¨ una sorpresa dedicata a te.',
+    spinLabel: 'Gira la ruota',
+    footer: 'Un solo giro a persona. I premi sono validi sul nostro shop.',
+    password: process.env.ADMIN_PASSWORD || 'ohana2026'
+  },
+  prizes: [
+    { id: 1, name: 'Sconto 10%', weight: 30 },
+    { id: 2, name: 'Spedizione gratuita', weight: 22 },
+    { id: 3, name: 'Riprova', weight: 24 },
+    { id: 4, name: 'Sconto 20%', weight: 12 },
+    { id: 5, name: 'Bracciale omaggio', weight: 7 },
+    { id: 6, name: 'Choker in omaggio', weight: 5 }
+  ],
+  winners: []
+};
+
+// ---------- persistence ----------
+function loadDB() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      return { config: Object.assign({}, DEFAULTS.config, db.config), prizes: db.prizes || [], winners: db.winners || [] };
+    }
+  } catch (e) { console.error('DB load error:', e.message); }
+  return JSON.parse(JSON.stringify(DEFAULTS));
+}
+function saveDB() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = DB_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+  fs.renameSync(tmp, DB_FILE);
+}
+let db = loadDB();
+
+// ---------- auth tokens (in-memory, 12h) ----------
+const tokens = new Map();
+function makeToken() {
+  const t = crypto.randomBytes(24).toString('hex');
+  tokens.set(t, Date.now() + 12 * 3600 * 1000);
+  return t;
+}
+function isAuth(req) {
+  const h = req.headers.authorization || '';
+  const t = h.replace(/^Bearer\s+/i, '');
+  const exp = tokens.get(t);
+  if (!exp) return false;
+  if (Date.now() > exp) { tokens.delete(t); return false; }
+  return true;
+}
+
+// ---------- simple rate limit: 20 req/min per IP ----------
+const hits = new Map();
+function rateLimited(req) {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '?';
+  const now = Date.now();
+  const h = hits.get(ip) || { count: 0, reset: now + 60000 };
+  if (now > h.reset) { h.count = 0; h.reset = now + 60000; }
+  h.count++;
+  hits.set(ip, h);
+  return h.count > 20;
+}
+
+// ---------- helpers ----------
+function send(res, code, data) {
+  const body = JSON.stringify(data);
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+  res.end(body);
+}
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', c => { raw += c; if (raw.length > 1e5) req.destroy(); });
+    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+function publicConfig() {
+  return { title: db.config.title, tagline: db.config.tagline, spinLabel: db.config.spinLabel, footer: db.config.footer, prizes: db.prizes };
+}
+
+// ---------- static files ----------
+const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css', '.js': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json' };
+function serveStatic(req, res) {
+  let p = decodeURIComponent(req.url.split('?')[0]);
+  if (p === '/') p = '/index.html';
+  const file = path.normalize(path.join(PUBLIC_DIR, p));
+  if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('forbidden'); }
+  fs.readFile(file, (err, data) => {
+    if (err) { res.writeHead(404); return res.end('not found'); }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(file)] || 'application/octet-stream' });
+    res.end(data);
+  });
+}
+
+// ---------- server ----------
+const server = http.createServer(async (req, res) => {
+  if (rateLimited(req)) return send(res, 429, { error: 'Troppe richieste, riprova tra poco.' });
+  const url = req.url.split('?')[0];
+  const method = req.method;
+
+  try {
+    if (!url.startsWith('/api/')) return serveStatic(req, res);
+
+    // public
+    if (method === 'GET' && url === '/api/config') return send(res, 200, publicConfig());
+
+    if (method === 'POST' && url === '/api/login') {
+      const b = await readBody(req);
+      if (b.password && b.password === db.config.password) return send(res, 200, { token: makeToken() });
+      return send(res, 401, { error: 'Password errata' });
+    }
+
+    if (method === 'POST' && url === '/api/spin') {
+      const b = await readBody(req);
+      const name = String(b.name || '').trim();
+      if (name.length < 2) return send(res, 400, { error: 'Inserisci il tuo nome' });
+      const prizes = db.prizes.filter(p => p.weight > 0 && String(p.name).trim());
+      if (prizes.length < 2) return send(res, 400, { error: 'Ruota non configurata' });
+      const total = prizes.reduce((a, p) => a + Number(p.weight), 0);
+      let r = Math.random() * total, prize = prizes[prizes.length - 1];
+      for (const p of prizes) { r -= p.weight; if (r <= 0) { prize = p; break; } }
+      const entry = { id: crypto.randomBytes(8).toString('hex'), name: name.slice(0, 40), prize: prize.name, ts: Date.now(), verified: false };
+      db.winners.push(entry);
+      saveDB();
+      return send(res, 200, { prize: prize.name });
+    }
+
+    // admin only
+    if (!isAuth(req)) return send(res, 401, { error: 'Non autorizzato' });
+
+    if (method === 'GET' && url === '/api/winners') return send(res, 200, { winners: db.winners });
+
+    if (method === 'DELETE' && url === '/api/winners') {
+      db.winners = []; saveDB();
+      return send(res, 200, { ok: true });
+    }
+
+    let m = url.match(/^\/api\/winners\/([a-f0-9]+)\/verify$/);
+    if (m && method === 'POST') {
+      const w = db.winners.find(x => x.id === m[1]);
+      if (!w) return send(res, 404, { error: 'Voce non trovata' });
+      w.verified = !w.verified; saveDB();
+      return send(res, 200, { verified: w.verified });
+    }
+
+    m = url.match(/^\/api\/winners\/([a-f0-9]+)$/);
+    if (m && method === 'DELETE') {
+      db.winners = db.winners.filter(x => x.id !== m[1]); saveDB();
+      return send(res, 200, { ok: true });
+    }
+
+    if (method === 'PUT' && url === '/api/config') {
+      const b = await readBody(req);
+      if (b.title) db.config.title = String(b.title).slice(0, 80);
+      if (b.tagline !== undefined) db.config.tagline = String(b.tagline).slice(0, 200);
+      if (b.spinLabel) db.config.spinLabel = String(b.spinLabel).slice(0, 40);
+      if (b.footer !== undefined) db.config.footer = String(b.footer).slice(0, 200);
+      if (b.password) db.config.password = String(b.password).slice(0, 80);
+      if (Array.isArray(b.prizes)) {
+        db.prizes = b.prizes
+          .map(p => ({ id: Number(p.id) || Date.now() + Math.floor(Math.random() * 999), name: String(p.name || '').slice(0, 60), weight: Math.max(0, Number(p.weight) || 0) }))
+          .filter(p => p.name.trim());
+      }
+      saveDB();
+      return send(res, 200, publicConfig());
+    }
+
+    return send(res, 404, { error: 'Not found' });
+  } catch (e) {
+    console.error(e);
+    return send(res, 500, { error: 'Errore interno' });
+  }
+});
+
+server.listen(PORT, () => console.log('Ohana Choker online su http://localhost:' + PORT));
